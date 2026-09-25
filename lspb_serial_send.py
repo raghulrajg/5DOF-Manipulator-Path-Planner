@@ -1,30 +1,36 @@
 """
 lspb_ik_serial_send.py
 
-Plans an LSPB trajectory to reach a specific Cartesian end-effector pose,
-solved via optimization-based inverse kinematics (joint limits enforced
-as bounds), then streams the quantized (1-deg resolution) joint
-commands over serial at a fixed 40 ms interval, paced in real time.
+Full pipeline: Cartesian target (T_target) -> bounded-optimization
+Inverse Kinematics -> LSPB trajectory -> 1-deg quantization -> real-time
+serial stream to the arm, at a fixed 40 ms interval.
 
-SIMPLIFIED CALIBRATION: kinematics.py's DH parameters were re-derived so
-that q = [0,0,0,0,0] now corresponds directly to hardware home
-(servo [90, 180, 180, 90, 0]). There is no more separate "kin space" vs
-"true-DH-hw space" -- the DH joint angle IS the calibration angle:
+================================================================
+SIMPLIFICATION: DH HOME NOW == HARDWARE HOME
+================================================================
+The DH parameters were rebuilt so that q = [0,0,0,0,0] corresponds
+directly to hardware home (servo = [90,180,180,90,0]). The IK solver's
+output (in degrees) IS the true-DH-hw value directly -- no shift
+conversion needed anymore.
 
-    servo = offset + direction * q_deg
-    offsets = [90, 180, 180, 90, 0]
+================================================================
+JOINT CONSTRAINTS -> SERVO DIRECTION
+================================================================
+Stated constraints: j1 = +/-90 deg, j2 = 0..180 deg, j4 = +/-90 deg.
+With offsets=[90,180,180,90,0], matching these requires
+directions=[1,-1,-1,1,1] (q2, q3 flipped relative to q1/q4/q5). q3's
+flip is inferred by symmetry with q2 since no constraint was stated for
+it -- VERIFY ON HARDWARE. q5's range [0,180] is unconstrained/unchanged.
 
-DIRECTION SIGNS ARE NOT YET VERIFIED. directions=[1,1,1,1,1] below is a
-placeholder. Before trusting any real move: command a small, safe
-positive-q step on each joint alone and confirm it rotates the way
-get_forward_kinematics predicts. Flip the sign for any joint that moves
-the wrong way, then update `directions` here (and in the quantized-plot
-script) to match.
-
-JOINT LIMITS (deg): q1 +/-90, q2 0..180, q3 0..180, q4 +/-90, q5 +/-180
-(kinematics.JOINT_LIMITS_DEG). These are enforced directly inside the
-IK optimizer (inverse_kinematics_opt) as bounds, and re-checked again
-before planning/sending as a second line of defense.
+================================================================
+WHY BOUNDED OPTIMIZATION INSTEAD OF DLS + REJECT/CLIP
+================================================================
+scipy.optimize.minimize with bounds=... enforces joint limits AS PART OF
+the search (L-BFGS-B is a bounded solver) -- it cannot step outside the
+given range, so there's nothing to reject or clip afterward. Multi-start
+(several random starting points) is still used to avoid poor local
+minima in the pose-error cost, not to avoid limit violations.
+================================================================
 """
 
 import time
@@ -32,11 +38,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from lspb_joint_limits import ServoCalibration, LSPBTrajectory
-from python_arm.kinematics import (
-    get_forward_kinematics,
-    inverse_kinematics_opt,
-    JOINT_LIMITS_DEG,
-)
+from kinematics import get_forward_kinematics, inverse_kinematics_optimized
 
 try:
     import serial
@@ -55,34 +57,45 @@ SERIAL_ENABLED = True
 SERIAL_PORT = "COM20"
 SERIAL_BAUD = 115200
 
+# ---- Hardware calibration: offsets unchanged, directions per note above ----
 cal = ServoCalibration(offsets=[90, 180, 180, 90, 0],
-                        directions=[1, 1, 1, 1, 1],   # VERIFY against hardware -- see note above
+                        directions=[1, -1, -1, 1, 1],   # verify q2,q3 on hardware!
                         servo_min=0, servo_max=180)
 
+# ---- Joint constraints (for the IK optimizer's bounds) ----
+JOINT_BOUNDS_DEG = [(-90, 90), (0, 180), (0, 180), (-90, 90), (0, 180)]
+JOINT_BOUNDS_RAD = [(np.radians(lo), np.radians(hi)) for lo, hi in JOINT_BOUNDS_DEG]
+
+print("Joint bounds (deg):")
+for i in range(5):
+    print(f"  {JOINT_NAMES[i]}: {JOINT_BOUNDS_DEG[i]}")
+
 # ======================================================================
-# 1. Specify the move: solve IK for the desired Cartesian target
+# 1. Solve IK for the Cartesian target
 # ======================================================================
 T_target = np.array([
-    [ 0,     0,     1,    0.4610   ],
-    [0.,    -1,    -0,     0],
-    [1.,     0.,     0.,     0],
-    [ 0.,     0.,     0.,     1.   ]])
+    [ 0.,    1.,    0.,    -0.   ],
+    [-0.,    0.,   -1.,    -0.461],
+    [-1.,    0.,    0.,     0.08 ],
+    [ 0.,    0.,    0.,     1.   ]])
 
-q_start_deg = np.array([0.0, 0.0, 0.0, 0.0, 0.0]) 
+q_solved, cost, success = inverse_kinematics_optimized(
+    T_target, JOINT_BOUNDS_RAD, qh=0.0)
 
-T_check = get_forward_kinematics(np.deg2rad(np.array([90, 90, 180, 0, 0])), qh=0.0)
+print(f"\nIK cost: {cost:.2e}   success: {success}")
+if not success:
+    print("WARNING: IK did not converge cleanly -- verify this target in "
+          "lspb_quantized_plot.py's plot BEFORE sending to real hardware. "
+          "It may be unreachable within the given joint bounds.")
 
-q_solved_rad, ik_result = inverse_kinematics_opt(
-    T_check, np.deg2rad(q_start_deg), qh=0.0
-)
-q_target_deg = np.round(np.rad2deg(q_solved_rad))
-
-print("IK optimizer success:", ik_result.success, " final cost:", ik_result.cost)
-print("IK solved joint angles (deg):", q_target_deg)
+q_true_hw_target = np.degrees(q_solved)
+print("Solved joint target (deg):", np.round(q_true_hw_target, 2))
 
 # ======================================================================
-# 2. Plan the move
+# 2. Plan the move (true-DH space: 0 = calibrated hardware home)
 # ======================================================================
+q0_true = [0, 0, 0, 0, 0]
+qf_true = q_true_hw_target.tolist()
 vmax = [60, 60, 60, 90, 90]
 amax = [120, 120, 120, 180, 180]
 
@@ -90,8 +103,7 @@ traj = LSPBTrajectory(n_joints=5)
 
 
 class _LimitCheck:
-    q_min = [lo for lo, hi in JOINT_LIMITS_DEG]
-    q_max = [hi for lo, hi in JOINT_LIMITS_DEG]
+    q_min, q_max = cal.q_min, cal.q_max
     def check_within_limits(self, q, names=None):
         bad = [f"{names[i] if names else i}={q[i]:.2f} (allowed "
                f"[{self.q_min[i]:.1f},{self.q_max[i]:.1f}])"
@@ -104,18 +116,18 @@ class _LimitCheck:
 traj.cal = _LimitCheck()
 traj.joint_names = JOINT_NAMES
 
-print("\nJoint limits (deg):")
+print("\nTrue DH / servo-calibration limits per joint:")
 for i in range(5):
-    print(f"  {JOINT_NAMES[i]}: [{traj.cal.q_min[i]:.1f}, {traj.cal.q_max[i]:.1f}]")
+    print(f"  {JOINT_NAMES[i]}: [{cal.q_min[i]:.1f}, {cal.q_max[i]:.1f}]")
 
-tf = traj.plan(q_start_deg.tolist(), q_target_deg.tolist(), vmax, amax)
+tf = traj.plan(q0_true, qf_true, vmax, amax)
 print(f"\nMove time: {tf:.3f} s  |  send interval: {SEND_INTERVAL*1000:.0f} ms  "
       f"-> {int(np.ceil(tf/SEND_INTERVAL))+1} samples")
 
 
 def quantized_servo(t):
-    q_deg = traj.get_state(t)[0]
-    s = cal.dh_to_servo(q_deg)
+    q_true = traj.get_state(t)[0]
+    s = cal.dh_to_servo(q_true)
     return (np.round(s / SERVO_RESOLUTION_DEG) * SERVO_RESOLUTION_DEG).astype(int)
 
 
@@ -127,8 +139,8 @@ t_plot = np.arange(0, tf + dt_plot, dt_plot)
 servo_ideal = np.zeros((5, len(t_plot)))
 servo_quant_plot = np.zeros((5, len(t_plot)))
 for i, ti in enumerate(t_plot):
-    q_deg = traj.get_state(ti)[0]
-    s = cal.dh_to_servo(q_deg)
+    q_true = traj.get_state(ti)[0]
+    s = cal.dh_to_servo(q_true)
     servo_ideal[:, i] = s
     servo_quant_plot[:, i] = np.round(s / SERVO_RESOLUTION_DEG) * SERVO_RESOLUTION_DEG
 
@@ -141,7 +153,7 @@ for j in range(5):
     axs[j].grid(True, alpha=0.3)
 axs[0].legend(loc="lower right", fontsize=8)
 axs[-1].set_xlabel("Time (s)")
-fig.suptitle("IK-target LSPB Trajectory: Ideal vs Quantized", y=0.995)
+fig.suptitle("IK-optimized LSPB Trajectory: Ideal vs Quantized", y=0.995)
 plt.tight_layout()
 plt.savefig("lspb_ik_quantized_path.png", dpi=150)
 print("Saved plot.")
