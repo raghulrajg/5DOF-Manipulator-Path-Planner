@@ -23,13 +23,15 @@ flip is inferred by symmetry with q2 since no constraint was stated for
 it -- VERIFY ON HARDWARE. q5's range [0,180] is unconstrained/unchanged.
 
 ================================================================
-WHY BOUNDED OPTIMIZATION INSTEAD OF DLS + REJECT/CLIP
+WHY BOUNDED LEAST-SQUARES OPTIMIZATION INSTEAD OF DLS + REJECT/CLIP
 ================================================================
-scipy.optimize.minimize with bounds=... enforces joint limits AS PART OF
-the search (L-BFGS-B is a bounded solver) -- it cannot step outside the
-given range, so there's nothing to reject or clip afterward. Multi-start
-(several random starting points) is still used to avoid poor local
-minima in the pose-error cost, not to avoid limit violations.
+scipy.optimize.least_squares (trust-region reflective) with bounds=...
+enforces joint limits AS PART OF the search -- it cannot step outside
+the given range, so there's nothing to reject or clip afterward. It also
+converges far more reliably than a scalar bounded minimizer, especially
+near joint-limit boundaries. Multi-start (several random starting
+points, plus an optional primary_guess) is still used to avoid landing
+on a different-but-valid solution branch than the one you intended.
 ================================================================
 """
 
@@ -38,7 +40,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from lspb_joint_limits import ServoCalibration, LSPBTrajectory
-from kinematics import get_forward_kinematics, inverse_kinematics_optimized
+from python_arm.kinematics import get_forward_kinematics, inverse_kinematics_optimized
 
 try:
     import serial
@@ -73,14 +75,19 @@ for i in range(5):
 # ======================================================================
 # 1. Solve IK for the Cartesian target
 # ======================================================================
-T_target = np.array([
-    [ 0.,    1.,    0.,    -0.   ],
-    [-0.,    0.,   -1.,    -0.461],
-    [-1.,    0.,    0.,     0.08 ],
-    [ 0.,    0.,    0.,     1.   ]])
+q_default = [np.radians(30), np.radians(45), np.radians(90), np.radians(90), np.radians(0)]
+qh_fixed = 0.0
+T_target = get_forward_kinematics(q_default, qh_fixed)
 
+# Passing q_default as primary_guess biases the solver toward THIS exact
+# configuration, rather than an equally-valid but different one -- the
+# arm is redundant for some poses (multiple joint sets can reach the
+# same pose), so without this the solver has no way to know which one
+# you actually meant. If you instead have a raw Cartesian pose (not
+# built from known joint angles), set primary_guess=None or supply your
+# own preferred configuration in radians.
 q_solved, cost, success = inverse_kinematics_optimized(
-    T_target, JOINT_BOUNDS_RAD, qh=0.0)
+    T_target, JOINT_BOUNDS_RAD, qh=qh_fixed, primary_guess=q_default)
 
 print(f"\nIK cost: {cost:.2e}   success: {success}")
 if not success:
@@ -88,7 +95,7 @@ if not success:
           "lspb_quantized_plot.py's plot BEFORE sending to real hardware. "
           "It may be unreachable within the given joint bounds.")
 
-q_true_hw_target = np.degrees(q_solved)
+q_true_hw_target = np.degrees(q_solved)   # kin == true-DH-hw directly now
 print("Solved joint target (deg):", np.round(q_true_hw_target, 2))
 
 # ======================================================================

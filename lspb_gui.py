@@ -1,25 +1,3 @@
-"""
-lspb_gui.py
-
-Standalone desktop GUI for LSPB trajectory planning on a 5-DOF arm.
-
-Requires:
-    pip install numpy matplotlib
-
-Run:
-    python lspb_gui.py
-
-Features (mirrors the web version):
-  - Per-joint: servo offset, direction (+1/-1), "no-remap" flag, q0/qf
-    (planning-space), vmax, amax
-  - Global: servo min/max, servo resolution (deg)
-  - Live validation against derived joint limits (true DH range and
-    planning-space range)
-  - "Plan & Plot" button: computes synchronized LSPB trajectory, converts
-    to servo commands, quantizes to servo resolution, and plots ideal vs
-    quantized position curves for all 5 joints
-"""
-
 import tkinter as tk
 from tkinter import ttk
 import numpy as np

@@ -70,12 +70,21 @@ for i in range(5):
 # ======================================================================
 # 1. Solve IK for the Cartesian target
 # ======================================================================
-q_default = [np.radians(0), np.radians(120), np.radians(60), np.radians(0), np.radians(90)]
+q_default = [np.radians(0), np.radians(0), np.radians(0), np.radians(0), np.radians(0)]
 qh_fixed = 0.0
 T_target = get_forward_kinematics(q_default, qh_fixed)
 
+# Passing q_default as primary_guess biases the solver toward THIS exact
+# configuration, rather than an equally-valid but different one -- the
+# arm is redundant for some poses (multiple joint sets can reach the
+# same pose), so without this the solver has no way to know which one
+# you actually meant.
 q_solved, cost, success = inverse_kinematics_optimized(
-    T_target, JOINT_BOUNDS_RAD, qh=qh_fixed)
+    T_target, JOINT_BOUNDS_RAD, qh=qh_fixed, primary_guess=q_default)
+
+T_target = get_forward_kinematics(q_solved, qh_fixed)
+print("\nTarget pose (T_target):")
+print(T_target)
 
 print(f"\nIK cost: {cost:.2e}   success: {success}")
 if not success:

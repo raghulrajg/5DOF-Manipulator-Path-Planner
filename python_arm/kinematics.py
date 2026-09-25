@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import least_squares
 
 
 def get_forward_kinematics(q, qh=0.0):
@@ -95,66 +95,88 @@ def inverse_kinematics_dls(T_target, q_guess, qh=0.0, max_iter=1000,
     return q
 
 
-def _pose_error(q, T_target, qh, w_pos=1.0, w_orient=0.3):
-    """Weighted squared position + orientation error, for the optimizer's cost."""
+def _pose_residuals(q, T_target, qh, w_pos=1.0, w_orient=1.0):
+    """
+    Residual vector (not a scalar) for least_squares: 3 position residuals
+    + 9 rotation-matrix-difference residuals. least_squares minimizes the
+    sum of squares of ALL these components using a proper nonlinear
+    least-squares algorithm (trust-region reflective), which is far more
+    reliable at actually reaching zero residual (when a solution exists)
+    than treating pose-matching as a single scalar cost for a general
+    bounded minimizer (L-BFGS-B) -- especially near joint-limit
+    boundaries, where a scalar optimizer's gradient can get clipped
+    before it finds the exact solution.
+    """
     T = get_forward_kinematics(q, qh)
-    p_err = T[0:3, 3] - T_target[0:3, 3]
-
-    R_err = T_target[0:3, 0:3] @ T[0:3, 0:3].T
-    w_err = np.array([
-        R_err[2, 1] - R_err[1, 2],
-        R_err[0, 2] - R_err[2, 0],
-        R_err[1, 0] - R_err[0, 1]
-    ]) / 2.0
-
-    return w_pos * np.sum(p_err**2) + w_orient * np.sum(w_err**2)
+    p_err = (T[0:3, 3] - T_target[0:3, 3]) * np.sqrt(w_pos)
+    R_err = (T[0:3, 0:3] - T_target[0:3, 0:3]).flatten() * np.sqrt(w_orient)
+    return np.concatenate([p_err, R_err])
 
 
 def inverse_kinematics_optimized(T_target, bounds_rad, qh=0.0,
                                   n_starts=8, seed=0,
-                                  w_pos=1.0, w_orient=0.3):
+                                  w_pos=1.0, w_orient=1.0,
+                                  primary_guess=None):
     """
-    Bounded-optimization Inverse Kinematics: minimizes weighted pose error
-    (position + orientation) subject to joint-limit bounds using
-    scipy.optimize.minimize (L-BFGS-B), which respects the bounds by
-    construction -- no post-hoc rejection, clipping, or fallback needed,
-    unlike an unconstrained iterative solver (e.g. DLS).
+    Bounded nonlinear-least-squares Inverse Kinematics: minimizes the sum
+    of squared position + orientation residuals subject to joint-limit
+    bounds using scipy.optimize.least_squares (trust-region reflective),
+    which respects the bounds by construction. Prefer this over a scalar
+    bounded minimizer (L-BFGS-B on a single weighted cost) -- least_squares
+    is purpose-built for exactly this "drive many residuals to zero"
+    problem and converges far more reliably to an exact solution when one
+    exists, including near joint-limit boundaries.
 
-    Tries several starting points (multi-start, to reduce the chance of
-    landing in a poor local minimum) and returns the best result.
+    Tries several starting points (multi-start) and returns the best
+    result by final residual norm.
 
     Parameters:
         T_target  : 4x4 target pose
-        bounds_rad: list of (min, max) tuples in RADIANS, one per joint --
-                    this is where your joint constraints (j1=+/-90 deg,
-                    j2=0..180 deg, j4=+/-90 deg, etc, converted to
-                    radians) are enforced
+        bounds_rad: list of (min, max) tuples in RADIANS, one per joint
         qh        : fixed helper joint parameter (unchanged, e.g. 0.0)
         n_starts  : number of random starting points to try, in addition
                     to the midpoint of the bounds
-        w_pos, w_orient: relative weight of position vs orientation error
-                    in the cost function
+        w_pos, w_orient: relative weight of position vs orientation
+                    residuals (equal by default -- unlike the old scalar
+                    cost, there is no need to underweight orientation)
+        primary_guess: optional joint angles (radians) to try FIRST --
+                    see docstring note below on redundancy.
 
     Returns: (q_solved_rad, cost, success)
-        cost is the final weighted pose-error value (near 0 = good fit).
-        success is True only if scipy reports convergence AND cost is
-        below a sane threshold -- always check this before trusting q.
+        cost is the final sum-of-squared-residuals (near 0 = good fit).
+        success is True only if the residual norm is below a sane
+        threshold -- always check this before trusting q.
+
+    Note on redundancy: a 5-DOF arm can have MULTIPLE joint
+    configurations reaching the same pose. The solver has no way to know
+    which one you want unless you tell it via primary_guess -- without
+    it, you may get a different (but equally valid) solution than the
+    one you had in mind.
     """
     bounds_rad = list(bounds_rad)
     lo = np.array([b[0] for b in bounds_rad])
     hi = np.array([b[1] for b in bounds_rad])
 
     rng = np.random.default_rng(seed)
-    starts = [(lo + hi) / 2.0]  # midpoint of bounds as first guess
+    starts = []
+    if primary_guess is not None:
+        starts.append(np.array(primary_guess, dtype=float))
+    starts.append((lo + hi) / 2.0)
     for _ in range(n_starts):
         starts.append(rng.uniform(lo, hi))
 
-    best_result = None
+    best = None  # (cost, q_sol)
     for q0 in starts:
-        res = minimize(_pose_error, q0, args=(T_target, qh, w_pos, w_orient),
-                        method="L-BFGS-B", bounds=bounds_rad)
-        if best_result is None or res.fun < best_result.fun:
-            best_result = res
+        q0_clipped = np.clip(q0, lo, hi)  # least_squares requires x0 strictly within bounds
+        res = least_squares(_pose_residuals, q0_clipped,
+                             args=(T_target, qh, w_pos, w_orient),
+                             bounds=(lo, hi), method="trf")
+        cost = np.sum(res.fun**2)
+        if best is None or cost < best[0]:
+            best = (cost, res.x)
+        if primary_guess is not None and cost < 1e-10:
+            break
 
-    success = bool(best_result.success and best_result.fun < 1e-4)
-    return best_result.x, best_result.fun, success
+    cost, q_sol = best
+    success = bool(cost < 1e-6)
+    return q_sol, cost, success
