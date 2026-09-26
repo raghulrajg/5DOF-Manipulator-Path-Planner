@@ -32,12 +32,20 @@ def get_effective_transformation(dh_table):
 
 # --- Define your 5-DOF Manipulator DH Parameters ---
 # Format: [alpha, a, d, theta]
-# Replace these placeholder values with your specific robot configuration specs:
 
-theta1 = np.radians(0)  # Joint 1 angle in radians
-theta2 = np.radians(-90)  # Joint 2 angle in radians
-theta3 = np.radians(180)  # Joint 3 angle in radians
-theta4 = np.radians(0)  # Joint 4 angle in radians
+"""
+    Joint Limits (in degrees):
+theta1:  -90 to 90
+theta2:  -180 to 0
+theta3:  0 to 180
+theta4:  -90 to 90
+theta5:  0 to 180
+"""
+
+theta1 = np.radians(30)  # Joint 1 angle in radians
+theta2 = np.radians(-45)  # Joint 2 angle in radians
+theta3 = np.radians(90)  # Joint 3 angle in radians
+theta4 = np.radians(-90)  # Joint 4 angle in radians
 theta5 = np.radians(0)  # Joint 5 angle in radians
 
 dh_parameters = [
