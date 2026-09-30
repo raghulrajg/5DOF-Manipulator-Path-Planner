@@ -60,7 +60,7 @@ for i in range(5):
 # ======================================================================
 # 1. Solve IK for the Cartesian target
 # ======================================================================
-q_default = [np.radians(30), np.radians(-26), np.radians(73), np.radians(5), np.radians(0)]
+q_default = [np.radians(0), np.radians(-26), np.radians(73), np.radians(5), np.radians(0)]
 T_target = get_forward_kinematics(q_default)
 
 # Passing q_default as primary_guess biases the solver toward THIS exact

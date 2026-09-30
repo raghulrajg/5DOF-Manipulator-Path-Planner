@@ -25,4 +25,4 @@ dist/
 .DS_Store
 Thumbs.db
 
-lspb_quantized_path.png
+*.png
