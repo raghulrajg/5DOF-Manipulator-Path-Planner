@@ -24,3 +24,5 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
+
+lspb_quantized_path.png

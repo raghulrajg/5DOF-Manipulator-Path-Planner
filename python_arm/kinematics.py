@@ -2,50 +2,82 @@ import numpy as np
 from scipy.optimize import least_squares
 
 
-def get_forward_kinematics(q, qh=0.0):
+def dh_transformation_matrix(alpha, a, d, theta):
     """
-    Computes the Forward Kinematics for the 5-DOF robotic arm, using the
-    UPDATED DH table (built so that q = [0,0,0,0,0] corresponds directly
-    to hardware home, servo = [90,180,180,90,0]).
-    """
-    q1, q2, q3, q4, q5 = q
+    Computes the standard Denavit-Hartenberg (DH) homogeneous transformation matrix.
 
-    # DH Parameters [a (meters), alpha (radians), d (meters), theta (radians)]
-    dh_params = [
-        [0.0,    np.pi/2, 0.04,  q1],
-        [0.195,  0.0,     0.0,   q2 + np.pi],
-        [0.04,   0.0,     0.0,   qh - np.pi/2],
-        [0.14,   0.0,     0.0,   q3 - np.pi/2],
-        [0.0,    np.pi/2, 0.0,   q4 + np.pi/2],
-        [0.0,    0.0,     0.126, q5]
+    Parameters:
+    alpha : float - Link twist (radians)
+    a     : float - Link length
+    d     : float - Link offset
+    theta : float - Joint angle (radians)
+    """
+    return np.array([
+        [np.cos(theta), -np.sin(theta) * np.cos(alpha),  np.sin(theta) * np.sin(alpha), a * np.cos(theta)],
+        [np.sin(theta),  np.cos(theta) * np.cos(alpha), -np.cos(theta) * np.sin(alpha), a * np.sin(theta)],
+        [0,              np.sin(alpha),                  np.cos(alpha),                 d],
+        [0,              0,                              0,                             1]
+    ])
+
+
+def get_effective_transformation(dh_table):
+    """
+    Computes the overall effective transformation matrix by multiplying joint matrices.
+    """
+    T_eff = np.eye(4)
+    for row in dh_table:
+        alpha, a, d, theta = row
+        T_next = dh_transformation_matrix(alpha, a, d, theta)
+        T_eff = np.dot(T_eff, T_next)
+    return T_eff
+
+
+def build_dh_table(q):
+    """
+    Builds the 5-row DH table for the manipulator from joint angles q
+    (radians). This is the UPDATED DH table -- no qh helper joint;
+    q = [0,0,0,0,0] corresponds to hardware home
+    (servo = [90,180,180,90,0]).
+
+    Joint limits (degrees), for reference:
+        theta1: -90 to 90
+        theta2: -180 to 0
+        theta3: 0 to 180
+        theta4: -90 to 90
+        theta5: 0 to 180
+    """
+    theta1, theta2, theta3, theta4, theta5 = q
+
+    return [
+        #    alpha,           a,     d,     theta
+        [np.radians(90),      0,    0.04,  theta1],                      # Joint 1
+        [       0,          0.199,    0,   theta2 + np.radians(168.4)],  # Joint 2
+        [       0,          0.14,     0,   theta3 - np.radians(168.4)],  # Joint 3
+        [np.radians(90),      0,      0,   theta4 + np.radians(90)],     # Joint 4
+        [       0,            0,    0.126, theta5]                       # Joint 5
     ]
 
-    T_effective = np.eye(4)
 
-    for a, alpha, d, theta in dh_params:
-        A = np.array([
-            [np.cos(theta), -np.sin(theta)*np.cos(alpha),  np.sin(theta)*np.sin(alpha), a*np.cos(theta)],
-            [np.sin(theta),  np.cos(theta)*np.cos(alpha), -np.cos(theta)*np.sin(alpha), a*np.sin(theta)],
-            [0.0,            np.sin(alpha),                np.cos(alpha),               d],
-            [0.0,            0.0,                          0.0,                         1.0]
-        ])
-        T_effective = T_effective @ A
-
-    return T_effective
+def get_forward_kinematics(q):
+    """
+    Computes the Forward Kinematics for the 5-DOF robotic arm using the
+    updated DH table (no qh helper joint).
+    """
+    return get_effective_transformation(build_dh_table(q))
 
 
-def numeric_jacobian(q, qh=0.0):
+def numeric_jacobian(q):
     """
     Calculates the 6x5 numeric Jacobian matrix.
     """
     delta = 1e-5
     J = np.zeros((6, len(q)))
-    T_base = get_forward_kinematics(q, qh)
+    T_base = get_forward_kinematics(q)
 
     for i in range(len(q)):
         q_step = np.copy(q)
         q_step[i] += delta
-        T_step = get_forward_kinematics(q_step, qh)
+        T_step = get_forward_kinematics(q_step)
 
         dp = (T_step[0:3, 3] - T_base[0:3, 3]) / delta
 
@@ -61,18 +93,17 @@ def numeric_jacobian(q, qh=0.0):
     return J
 
 
-def inverse_kinematics_dls(T_target, q_guess, qh=0.0, max_iter=1000,
+def inverse_kinematics_dls(T_target, q_guess, max_iter=1000,
                             lambda_factor=0.1, tol=1e-6):
     """
     Jacobian Damped Least Squares Inverse Kinematics solver (UNCONSTRAINED
     -- does not respect joint limits). Kept for reference/comparison;
-    prefer inverse_kinematics_optimized() below for actual use, since it
-    enforces joint limits directly instead of needing post-hoc rejection.
+    prefer inverse_kinematics_optimized() below for actual use.
     """
     q = np.array(q_guess, dtype=float)
 
     for _ in range(max_iter):
-        T_curr = get_forward_kinematics(q, qh)
+        T_curr = get_forward_kinematics(q)
         p_err = T_target[0:3, 3] - T_curr[0:3, 3]
         R_diff = T_target[0:3, 0:3] @ T_curr[0:3, 0:3].T
         w_err = np.array([
@@ -85,7 +116,7 @@ def inverse_kinematics_dls(T_target, q_guess, qh=0.0, max_iter=1000,
         if np.linalg.norm(err_vec) < tol:
             break
 
-        J = numeric_jacobian(q, qh)
+        J = numeric_jacobian(q)
         H = J.T @ J + (lambda_factor**2) * np.eye(len(q))
         gradient = J.T @ err_vec
         dq = np.linalg.solve(H, gradient)
@@ -95,25 +126,20 @@ def inverse_kinematics_dls(T_target, q_guess, qh=0.0, max_iter=1000,
     return q
 
 
-def _pose_residuals(q, T_target, qh, w_pos=1.0, w_orient=1.0):
+def _pose_residuals(q, T_target, w_pos=1.0, w_orient=1.0):
     """
     Residual vector (not a scalar) for least_squares: 3 position residuals
-    + 9 rotation-matrix-difference residuals. least_squares minimizes the
-    sum of squares of ALL these components using a proper nonlinear
-    least-squares algorithm (trust-region reflective), which is far more
-    reliable at actually reaching zero residual (when a solution exists)
-    than treating pose-matching as a single scalar cost for a general
-    bounded minimizer (L-BFGS-B) -- especially near joint-limit
-    boundaries, where a scalar optimizer's gradient can get clipped
-    before it finds the exact solution.
+    + 9 rotation-matrix-difference residuals. Using the Frobenius-norm-
+    style residual (raw matrix difference) avoids the axis-angle vector-
+    part blind spot at 180-degree orientation errors (sin(180)=0).
     """
-    T = get_forward_kinematics(q, qh)
+    T = get_forward_kinematics(q)
     p_err = (T[0:3, 3] - T_target[0:3, 3]) * np.sqrt(w_pos)
     R_err = (T[0:3, 0:3] - T_target[0:3, 0:3]).flatten() * np.sqrt(w_orient)
     return np.concatenate([p_err, R_err])
 
 
-def inverse_kinematics_optimized(T_target, bounds_rad, qh=0.0,
+def inverse_kinematics_optimized(T_target, bounds_rad,
                                   n_starts=8, seed=0,
                                   w_pos=1.0, w_orient=1.0,
                                   primary_guess=None):
@@ -121,37 +147,25 @@ def inverse_kinematics_optimized(T_target, bounds_rad, qh=0.0,
     Bounded nonlinear-least-squares Inverse Kinematics: minimizes the sum
     of squared position + orientation residuals subject to joint-limit
     bounds using scipy.optimize.least_squares (trust-region reflective),
-    which respects the bounds by construction. Prefer this over a scalar
-    bounded minimizer (L-BFGS-B on a single weighted cost) -- least_squares
-    is purpose-built for exactly this "drive many residuals to zero"
-    problem and converges far more reliably to an exact solution when one
-    exists, including near joint-limit boundaries.
-
-    Tries several starting points (multi-start) and returns the best
-    result by final residual norm.
+    which respects the bounds by construction and converges reliably
+    even near joint-limit boundaries.
 
     Parameters:
         T_target  : 4x4 target pose
         bounds_rad: list of (min, max) tuples in RADIANS, one per joint
-        qh        : fixed helper joint parameter (unchanged, e.g. 0.0)
         n_starts  : number of random starting points to try, in addition
                     to the midpoint of the bounds
         w_pos, w_orient: relative weight of position vs orientation
-                    residuals (equal by default -- unlike the old scalar
-                    cost, there is no need to underweight orientation)
+                    residuals (equal by default)
         primary_guess: optional joint angles (radians) to try FIRST --
-                    see docstring note below on redundancy.
+                    biases the solver toward a specific configuration
+                    when the arm is redundant for a given pose (multiple
+                    joint sets can reach the same pose).
 
     Returns: (q_solved_rad, cost, success)
         cost is the final sum-of-squared-residuals (near 0 = good fit).
         success is True only if the residual norm is below a sane
         threshold -- always check this before trusting q.
-
-    Note on redundancy: a 5-DOF arm can have MULTIPLE joint
-    configurations reaching the same pose. The solver has no way to know
-    which one you want unless you tell it via primary_guess -- without
-    it, you may get a different (but equally valid) solution than the
-    one you had in mind.
     """
     bounds_rad = list(bounds_rad)
     lo = np.array([b[0] for b in bounds_rad])
@@ -167,9 +181,9 @@ def inverse_kinematics_optimized(T_target, bounds_rad, qh=0.0,
 
     best = None  # (cost, q_sol)
     for q0 in starts:
-        q0_clipped = np.clip(q0, lo, hi)  # least_squares requires x0 strictly within bounds
+        q0_clipped = np.clip(q0, lo, hi)
         res = least_squares(_pose_residuals, q0_clipped,
-                             args=(T_target, qh, w_pos, w_orient),
+                             args=(T_target, w_pos, w_orient),
                              bounds=(lo, hi), method="trf")
         cost = np.sum(res.fun**2)
         if best is None or cost < best[0]:

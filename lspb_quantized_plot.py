@@ -1,47 +1,37 @@
 """
 lspb_quantized_plot.py
 
-Plans an LSPB trajectory from a Cartesian target, using bounded-
-optimization inverse kinematics (joint limits enforced directly in the
-solver -- no post-hoc rejection or clipping needed), quantizes to
-1-degree servo resolution, and plots ideal vs quantized joint paths.
-No serial output -- plotting/verification only (see
-lspb_ik_serial_send.py for the version that streams to hardware).
+Plans an LSPB trajectory from a Cartesian target, using bounded nonlinear
+least-squares inverse kinematics (joint limits enforced directly in the
+solver), quantizes to 1-degree servo resolution, and plots ideal vs
+quantized joint paths. No serial output -- plotting/verification only
+(see lspb_ik_serial_send.py for the version that streams to hardware).
 
 ================================================================
-SIMPLIFICATION: DH HOME NOW == HARDWARE HOME
+UPDATED DH TABLE (no qh helper joint)
 ================================================================
-The DH parameters were rebuilt so that q = [0,0,0,0,0] corresponds
-directly to hardware home (servo = [90,180,180,90,0]). This removes the
-KIN_TO_HW_SHIFT conversion entirely -- the IK solver's output (in
-degrees) IS the true-DH-hw value; it only needs the servo direction and
-offset (ServoCalibration) to become an actual servo command.
+q = [0,0,0,0,0] corresponds directly to hardware home
+(servo = [90,180,180,90,0]). Joint limits (degrees):
+    theta1: -90 to 90     theta2: -180 to 0     theta3: 0 to 180
+    theta4: -90 to 90     theta5: 0 to 180
 
 ================================================================
-JOINT CONSTRAINTS -> SERVO DIRECTION
+JOINT LIMITS -> SERVO DIRECTION
 ================================================================
-Stated constraints: j1 = +/-90 deg, j2 = 0..180 deg, j4 = +/-90 deg.
-With offsets=[90,180,180,90,0] (unchanged), matching these constraints
-requires directions=[1,-1,-1,1,1] -- q2 and q3 need their servo
-direction FLIPPED relative to q1/q4/q5 (verified: [1,1,1,1,1] gives
-q2 range [-180,0], not the stated [0,180]; flipping q2 fixes it).
-q3's flip is inferred by symmetry with q2 (likely the same mechanical
-shoulder/elbow linkage) since no constraint was stated for it --
-VERIFY ON HARDWARE. q5's range [0,180] is unchanged/unconstrained.
+With offsets=[90,180,180,90,0] (unchanged), matching the stated limits
+requires directions=[1,1,-1,1,1] -- only q3 needs its servo direction
+FLIPPED relative to q1/q2/q4/q5 (verified: [1,1,1,1,1] gives q3 range
+[-180,0], not the stated [0,180]; flipping only q3 fixes it, and q2's
+[-180,0] already matches with no flip needed -- this is different from
+the previous DH table, where q2 also needed flipping).
 
 ================================================================
-WHY BOUNDED OPTIMIZATION INSTEAD OF DLS + REJECT/CLIP
+WHY BOUNDED LEAST-SQUARES OPTIMIZATION
 ================================================================
-The previous IK approach (unconstrained Jacobian DLS + multi-start +
-post-hoc range checking + clipping) worked but was fragile: it could
-converge to an out-of-range local minimum, and the accept/reject
-tolerance was sensitive to floating-point noise near boundaries.
-scipy.optimize.minimize with bounds=... enforces the joint limits AS
-PART OF the search itself (L-BFGS-B is a bounded solver) -- the
-optimizer physically cannot step outside the given range, so there is
-nothing to reject or clip afterward. Multi-start is still used (several
-random starting points) purely to avoid poor local minima in the pose-
-error cost function, not to avoid limit violations.
+scipy.optimize.least_squares (trust-region reflective) with bounds=...
+enforces joint limits AS PART OF the search and converges reliably even
+near joint-limit boundaries, unlike a scalar bounded minimizer or an
+unconstrained iterative solver (DLS) needing post-hoc reject/clip.
 ================================================================
 """
 
@@ -54,13 +44,13 @@ from python_arm.kinematics import get_forward_kinematics, inverse_kinematics_opt
 JOINT_NAMES = ["q1", "q2", "q3", "q4", "q5"]
 SERVO_RESOLUTION_DEG = 1.0
 
-# ---- Hardware calibration: offsets unchanged, directions per the note above ----
+# ---- Hardware calibration: offsets unchanged, direction per note above ----
 cal = ServoCalibration(offsets=[90, 180, 180, 90, 0],
-                        directions=[1, -1, -1, 1, 1],   # verify q2,q3 on hardware!
+                        directions=[1, 1, -1, 1, 1],   # verify q3 on hardware!
                         servo_min=0, servo_max=180)
 
 # ---- Joint constraints (radians, for the IK optimizer's bounds) ----
-JOINT_BOUNDS_DEG = [(-90, 90), (0, 180), (0, 180), (-90, 90), (0, 180)]
+JOINT_BOUNDS_DEG = [(-90, 90), (-180, 0), (0, 180), (-90, 90), (0, 180)]
 JOINT_BOUNDS_RAD = [(np.radians(lo), np.radians(hi)) for lo, hi in JOINT_BOUNDS_DEG]
 
 print("Joint bounds (deg):")
@@ -70,21 +60,17 @@ for i in range(5):
 # ======================================================================
 # 1. Solve IK for the Cartesian target
 # ======================================================================
-q_default = [np.radians(0), np.radians(0), np.radians(0), np.radians(0), np.radians(0)]
-qh_fixed = 0.0
-T_target = get_forward_kinematics(q_default, qh_fixed)
+q_default = [np.radians(30), np.radians(-26), np.radians(73), np.radians(5), np.radians(0)]
+T_target = get_forward_kinematics(q_default)
 
 # Passing q_default as primary_guess biases the solver toward THIS exact
 # configuration, rather than an equally-valid but different one -- the
 # arm is redundant for some poses (multiple joint sets can reach the
 # same pose), so without this the solver has no way to know which one
 # you actually meant.
-q_solved, cost, success = inverse_kinematics_optimized(
-    T_target, JOINT_BOUNDS_RAD, qh=qh_fixed, primary_guess=q_default)
-
-T_target = get_forward_kinematics(q_solved, qh_fixed)
-print("\nTarget pose (T_target):")
 print(T_target)
+q_solved, cost, success = inverse_kinematics_optimized(
+    T_target, JOINT_BOUNDS_RAD, primary_guess=q_default)
 
 print(f"\nIK cost: {cost:.2e}   success: {success}")
 if not success:
@@ -92,7 +78,7 @@ if not success:
           "carefully, or this target may be unreachable within the given "
           "joint bounds.")
 
-q_true_hw_target = np.degrees(q_solved)   # kin == true-DH-hw directly now
+q_true_hw_target = np.degrees(q_solved)   # kin == true-DH-hw directly
 print("Solved joint target (deg):", np.round(q_true_hw_target, 2))
 
 # ======================================================================
