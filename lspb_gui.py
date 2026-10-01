@@ -9,7 +9,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 # ======================================================================
-# Core math (same as the standalone scripts, kept self-contained here)
+# Core math
 # ======================================================================
 class ServoCalibration:
     def __init__(self, offsets, directions, servo_min=0.0, servo_max=180.0):
@@ -102,112 +102,278 @@ class LSPBTrajectory:
 
     def get_state(self, t):
         q = np.zeros(self.n)
+        qd = np.zeros(self.n)
+        qdd = np.zeros(self.n)
         ti = min(max(t, 0.0), self.tf)
+        
         for j in range(self.n):
             q0, qf, tb, a, v, tf = (self.q0[j], self.qf[j], self.tb[j],
                                      self.a[j], self.v[j], self.tf)
             if qf == q0:
-                q[j] = q0; continue
+                q[j] = q0; qd[j] = 0.0; qdd[j] = 0.0
+                continue
+            
             if ti <= tb:
                 q[j] = q0 + 0.5*a*ti**2
+                qd[j] = a * ti
+                qdd[j] = a
             elif ti <= tf - tb:
                 q[j] = q0 + a*tb*(ti - tb/2)
+                qd[j] = a * tb
+                qdd[j] = 0.0
             else:
                 q[j] = qf - 0.5*a*(tf-ti)**2
-        return q
+                qd[j] = a * (tf - ti)
+                qdd[j] = -a
+                
+        return q, qd, qdd
+
+
+class MultiSegmentLSPB:
+    """Chains multiple LSPB trajectories together to pass through Via Points"""
+    def __init__(self, n_joints):
+        self.n = n_joints
+        self.segments = []
+        self.via_times = []
+        self.total_tf = 0.0
+
+    def plan(self, waypoints_list, vmax, amax, desired_total_time=0.0, min_tf=0.05):
+        self.segments = []
+        self.via_times = [0.0]
+        self.total_tf = 0.0
+        
+        # Pass 1: Compute minimum time needed for each segment
+        min_seg_times = []
+        for i in range(len(waypoints_list) - 1):
+            q_start = waypoints_list[i]
+            q_end = waypoints_list[i+1]
+            seg = LSPBTrajectory(self.n)
+            tf = seg.plan(q_start, q_end, vmax, amax, min_tf)
+            min_seg_times.append(tf)
+
+        total_min_time = sum(min_seg_times)
+        
+        # Determine Scaling Factor if user provided a specific total time
+        scale = 1.0
+        time_warning = False
+        if desired_total_time > total_min_time:
+            scale = desired_total_time / total_min_time
+        elif desired_total_time > 0 and desired_total_time < total_min_time:
+            # Cannot shrink below physical limits (vmax/amax)
+            time_warning = True
+
+        # Pass 2: Plan segments with the scaled enforced times
+        for i in range(len(waypoints_list) - 1):
+            q_start = waypoints_list[i]
+            q_end = waypoints_list[i+1]
+            seg = LSPBTrajectory(self.n)
+            
+            enforced_tf = min_seg_times[i] * scale
+            tf = seg.plan(q_start, q_end, vmax, amax, min_tf=enforced_tf)
+            
+            self.segments.append(seg)
+            self.total_tf += tf
+            self.via_times.append(self.total_tf)
+            
+        return self.total_tf, time_warning
+
+    def get_state(self, t):
+        if t <= 0:
+            return self.segments[0].get_state(0.0)
+        if t >= self.total_tf:
+            return self.segments[-1].get_state(self.segments[-1].tf)
+            
+        for i, seg in enumerate(self.segments):
+            start_t = self.via_times[i]
+            end_t = self.via_times[i+1]
+            if start_t <= t <= end_t:
+                return seg.get_state(t - start_t)
+        
+        return self.segments[-1].get_state(self.segments[-1].tf)
 
 
 # ======================================================================
 # GUI
 # ======================================================================
 JOINT_NAMES = ["q1", "q2", "q3", "q4", "q5"]
+MAX_VIAS = 20  
+
 DEFAULTS = dict(
     offset=[0, 90, 90, 90, 0],
     direction=[1, 1, 1, 1, 1],
     no_remap=[False, False, False, False, True],
-    q0=[0, 0, 0, 0, 0],
-    qf=[45, -30, 60, 10, 60],
     vmax=[60, 60, 60, 90, 90],
     amax=[120, 120, 120, 180, 180],
+    via_paths=[
+        [0, 45, 90, 0],
+        [0, -30, -10, 0],
+        [0, 60, 30, 0],
+        [0, 10, 20, 0],
+        [0, 60, 45, 0]
+    ]
 )
-
 
 class LSPBApp:
     def __init__(self, root):
         self.root = root
-        root.title("LSPB Trajectory Planner")
+        root.title("LSPB Multi-Segment Trajectory Planner")
+        root.geometry("1200x850") 
 
-        self.vars = {k: [] for k in
-                     ["offset", "direction", "no_remap", "q0", "qf", "vmax", "amax"]}
+        # ---------------------------------------------------------
+        # Setting up a Scrollable Canvas (Vertical & Horizontal)
+        # ---------------------------------------------------------
+        self.main_canvas = tk.Canvas(root, highlightthickness=0)
+        self.v_scroll = ttk.Scrollbar(root, orient="vertical", command=self.main_canvas.yview)
+        self.h_scroll = ttk.Scrollbar(root, orient="horizontal", command=self.main_canvas.xview)
+        
+        self.scrollable_frame = ttk.Frame(self.main_canvas)
 
-        table = ttk.Frame(root, padding=10)
-        table.grid(row=0, column=0, sticky="w")
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.main_canvas.configure(
+                scrollregion=self.main_canvas.bbox("all")
+            )
+        )
 
-        headers = ["Joint", "Offset", "Dir", "No-remap", "q0", "qf", "vmax", "amax"]
-        for c, h in enumerate(headers):
-            ttk.Label(table, text=h, font=("", 9, "bold")).grid(row=0, column=c, padx=4)
+        self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.main_canvas.configure(yscrollcommand=self.v_scroll.set, xscrollcommand=self.h_scroll.set)
 
+        self.h_scroll.pack(side="bottom", fill="x")
+        self.v_scroll.pack(side="right", fill="y")
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        
+        root.bind_all("<MouseWheel>", self._on_mousewheel) 
+        root.bind_all("<Button-4>", self._on_mousewheel)   
+        root.bind_all("<Button-5>", self._on_mousewheel)   
+        
+        # ---------------------------------------------------------
+        # Initialize Variables
+        # ---------------------------------------------------------
+        self.vars = {
+            "offset": [tk.DoubleVar(value=DEFAULTS["offset"][i]) for i in range(5)],
+            "direction": [tk.StringVar(value=str(DEFAULTS["direction"][i])) for i in range(5)],
+            "no_remap": [tk.BooleanVar(value=DEFAULTS["no_remap"][i]) for i in range(5)],
+            "vmax": [tk.DoubleVar(value=DEFAULTS["vmax"][i]) for i in range(5)],
+            "amax": [tk.DoubleVar(value=DEFAULTS["amax"][i]) for i in range(5)],
+        }
+        
+        self.via_vars = []
         for i in range(5):
-            ttk.Label(table, text=JOINT_NAMES[i]).grid(row=i+1, column=0)
+            row = []
+            for j in range(MAX_VIAS):
+                val = DEFAULTS["via_paths"][i][j] if j < len(DEFAULTS["via_paths"][i]) else 0.0
+                row.append(tk.DoubleVar(value=val))
+            self.via_vars.append(row)
+            
+        self.num_vias_var = tk.IntVar(value=len(DEFAULTS["via_paths"][0]))
 
-            e_off = tk.DoubleVar(value=DEFAULTS["offset"][i])
-            ttk.Entry(table, textvariable=e_off, width=6).grid(row=i+1, column=1)
-            self.vars["offset"].append(e_off)
-
-            e_dir = tk.StringVar(value=str(DEFAULTS["direction"][i]))
-            ttk.Combobox(table, textvariable=e_dir, values=["1", "-1"],
-                         width=4, state="readonly").grid(row=i+1, column=2)
-            self.vars["direction"].append(e_dir)
-
-            e_nr = tk.BooleanVar(value=DEFAULTS["no_remap"][i])
-            ttk.Checkbutton(table, variable=e_nr).grid(row=i+1, column=3)
-            self.vars["no_remap"].append(e_nr)
-
-            for key, col in [("q0", 4), ("qf", 5), ("vmax", 6), ("amax", 7)]:
-                v = tk.DoubleVar(value=DEFAULTS[key][i])
-                ttk.Entry(table, textvariable=v, width=6).grid(row=i+1, column=col)
-                self.vars[key].append(v)
-
-        # Global params
-        gframe = ttk.Frame(root, padding=(10, 0))
-        gframe.grid(row=1, column=0, sticky="w")
+        # ---------------------------------------------------------
+        # UI Layout Construction
+        # ---------------------------------------------------------
+        # Top Config Frame
+        top_frame = ttk.Frame(self.scrollable_frame, padding=10)
+        top_frame.grid(row=0, column=0, sticky="w")
+        ttk.Label(top_frame, text="Number of Via Points:").pack(side="left")
+        ttk.Spinbox(top_frame, from_=2, to=MAX_VIAS, textvariable=self.num_vias_var, width=5).pack(side="left", padx=5)
+        ttk.Button(top_frame, text="Update Table Columns", command=self.build_table).pack(side="left", padx=10)
+        
+        # Dynamic Table Frame
+        self.table_frame = ttk.Frame(self.scrollable_frame, padding=(10, 0))
+        self.table_frame.grid(row=1, column=0, sticky="w")
+        
+        # Global Parameters Frame
+        gframe = ttk.Frame(self.scrollable_frame, padding=(10, 10))
+        gframe.grid(row=2, column=0, sticky="w")
+        
         self.servo_min = tk.DoubleVar(value=0)
         self.servo_max = tk.DoubleVar(value=180)
         self.resolution = tk.DoubleVar(value=1.0)
-        for label, var in [("Servo min", self.servo_min),
-                            ("Servo max", self.servo_max),
-                            ("Resolution (deg)", self.resolution)]:
+        self.num_samples = tk.IntVar(value=40) 
+        self.desired_time = tk.DoubleVar(value=0.0) # Added Desired Total Time
+        
+        inputs = [("Servo min", self.servo_min),
+                  ("Servo max", self.servo_max),
+                  ("Resolution (deg)", self.resolution),
+                  ("Time Steps (Dots)", self.num_samples),
+                  ("Desired Total Time (s) [0=Auto]", self.desired_time)]
+                  
+        for label, var in inputs:
             ttk.Label(gframe, text=label).pack(side="left", padx=(0, 4))
             ttk.Entry(gframe, textvariable=var, width=6).pack(side="left", padx=(0, 12))
 
-        ttk.Button(gframe, text="Plan & Plot", command=self.plan_and_plot).pack(side="left")
+        ttk.Button(gframe, text="Plan & Plot", command=self.plan_and_plot).pack(side="left", padx=15)
 
         # Status text
-        self.status = tk.Text(root, height=8, width=90, font=("Courier", 9))
-        self.status.grid(row=2, column=0, padx=10, pady=(6, 6), sticky="w")
+        self.status = tk.Text(self.scrollable_frame, height=6, width=120, font=("Courier", 9))
+        self.status.grid(row=3, column=0, padx=10, pady=(6, 6), sticky="w")
 
         # Matplotlib figure
-        self.fig = Figure(figsize=(9, 9))
-        self.axs = self.fig.subplots(5, 1, sharex=True)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
-        self.canvas.get_tk_widget().grid(row=3, column=0, padx=10, pady=(0, 10))
+        self.fig = Figure(figsize=(12, 10)) 
+        self.axs = self.fig.subplots(5, 3, sharex=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.scrollable_frame)
+        self.canvas.get_tk_widget().grid(row=4, column=0, padx=10, pady=(0, 10))
 
+        self.build_table()
         self.plan_and_plot()
+
+    def build_table(self):
+        for w in self.table_frame.winfo_children():
+            w.destroy()
+            
+        n_vias = self.num_vias_var.get()
+        if n_vias < 2:
+            n_vias = 2
+            self.num_vias_var.set(2)
+        elif n_vias > MAX_VIAS:
+            n_vias = MAX_VIAS
+            self.num_vias_var.set(MAX_VIAS)
+            
+        headers = ["Joint", "Offset", "Dir", "No-remap"] + [f"WP {j+1}" for j in range(n_vias)] + ["vmax", "amax"]
+        
+        for c, h in enumerate(headers):
+            ttk.Label(self.table_frame, text=h, font=("", 9, "bold")).grid(row=0, column=c, padx=4)
+
+        for i in range(5):
+            ttk.Label(self.table_frame, text=JOINT_NAMES[i]).grid(row=i+1, column=0)
+            ttk.Entry(self.table_frame, textvariable=self.vars["offset"][i], width=6).grid(row=i+1, column=1)
+            ttk.Combobox(self.table_frame, textvariable=self.vars["direction"][i], values=["1", "-1"],
+                         width=4, state="readonly").grid(row=i+1, column=2)
+            ttk.Checkbutton(self.table_frame, variable=self.vars["no_remap"][i]).grid(row=i+1, column=3)
+            
+            col_offset = 4
+            for j in range(n_vias):
+                ttk.Entry(self.table_frame, textvariable=self.via_vars[i][j], width=5).grid(row=i+1, column=col_offset+j, padx=2)
+                
+            ttk.Entry(self.table_frame, textvariable=self.vars["vmax"][i], width=6).grid(row=i+1, column=col_offset+n_vias, padx=2)
+            ttk.Entry(self.table_frame, textvariable=self.vars["amax"][i], width=6).grid(row=i+1, column=col_offset+n_vias+1, padx=2)
+
+    def _on_mousewheel(self, event):
+        if event.num == 4 or getattr(event, "delta", 0) > 0:
+            self.main_canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or getattr(event, "delta", 0) < 0:
+            self.main_canvas.yview_scroll(1, "units")
 
     def _read(self):
         offset = [v.get() for v in self.vars["offset"]]
         direction = [float(v.get()) for v in self.vars["direction"]]
         no_remap = [i for i, v in enumerate(self.vars["no_remap"]) if v.get()]
-        q0 = [v.get() for v in self.vars["q0"]]
-        qf = [v.get() for v in self.vars["qf"]]
         vmax = [v.get() for v in self.vars["vmax"]]
         amax = [v.get() for v in self.vars["amax"]]
-        return offset, direction, no_remap, q0, qf, vmax, amax
+        
+        n_vias = self.num_vias_var.get()
+        paths = []
+        for i in range(5):
+            pts = [self.via_vars[i][j].get() for j in range(n_vias)]
+            paths.append(pts)
+            
+        waypoints_list = np.array(paths).T.tolist()
+        
+        return offset, direction, no_remap, waypoints_list, vmax, amax
 
     def plan_and_plot(self):
         self.status.delete("1.0", tk.END)
         try:
-            offset, direction, no_remap, q0, qf, vmax, amax = self._read()
+            offset, direction, no_remap, waypoints_list, vmax, amax = self._read()
 
             cal = ServoCalibration(offset, direction,
                                     self.servo_min.get(), self.servo_max.get())
@@ -215,57 +381,104 @@ class LSPBApp:
 
             lines = []
             bad = False
-            for i in range(5):
-                lines.append(f"{JOINT_NAMES[i]}: plan range "
-                             f"[{view.q_plan_min[i]:.1f}, {view.q_plan_max[i]:.1f}]  "
-                             f"(true [{cal.q_min[i]:.1f}, {cal.q_max[i]:.1f}], "
-                             f"remap {view.remap_offset[i]:+.1f})")
-                if not (view.q_plan_min[i] - 1e-6 <= q0[i] <= view.q_plan_max[i] + 1e-6):
-                    lines.append(f"  ! q0 for {JOINT_NAMES[i]} out of range"); bad = True
-                if not (view.q_plan_min[i] - 1e-6 <= qf[i] <= view.q_plan_max[i] + 1e-6):
-                    lines.append(f"  ! qf for {JOINT_NAMES[i]} out of range"); bad = True
+            
+            for pt_idx, wp in enumerate(waypoints_list):
+                for i in range(5):
+                    if not (view.q_plan_min[i] - 1e-6 <= wp[i] <= view.q_plan_max[i] + 1e-6):
+                        lines.append(f"  ! Joint {JOINT_NAMES[i]} via point WP {pt_idx+1} ({wp[i]}) out of bounds.")
+                        bad = True
 
             if bad:
                 self.status.insert(tk.END, "\n".join(lines))
                 return
 
-            traj = LSPBTrajectory(n_joints=5)
-            tf = traj.plan(q0, qf, vmax, amax)
+            traj = MultiSegmentLSPB(n_joints=5)
+            
+            # Pass desired total time from GUI to the planner
+            desired_t = self.desired_time.get()
+            tf, time_warning = traj.plan(waypoints_list, vmax, amax, desired_total_time=desired_t)
 
-            dt = tf / 300
-            t = np.arange(0, tf + dt, dt)
-            ideal = np.zeros((5, len(t)))
-            quant = np.zeros((5, len(t)))
+            if time_warning:
+                lines.append(f"WARNING: Desired time ({desired_t}s) is too fast for the physical limits (vmax/amax).")
+                lines.append(f"The planner clamped the trajectory to the fastest possible safe time ({tf:.3f} s).")
+
+            n_samples = max(2, self.num_samples.get())
+            t_hr = np.linspace(0, tf, max(500, int(tf * 100)))
+            t_wp = np.linspace(0, tf, n_samples)
             res = self.resolution.get()
 
-            for k, ti in enumerate(t):
-                q_plan = traj.get_state(ti)
-                q_true = view.to_true(q_plan)
-                s = cal.dh_to_servo(q_true)
-                ideal[:, k] = s
-                quant[:, k] = np.round(s / res) * res
+            def compute_states(time_array):
+                q_arr = np.zeros((5, len(time_array)))
+                qd_arr = np.zeros((5, len(time_array)))
+                qdd_arr = np.zeros((5, len(time_array)))
+                
+                for k, ti in enumerate(time_array):
+                    q_plan, qd_plan, qdd_plan = traj.get_state(ti)
+                    q_true = view.to_true(q_plan)
+                    
+                    q_arr[:, k] = cal.dh_to_servo(q_true)
+                    qd_arr[:, k] = cal.directions * qd_plan
+                    qdd_arr[:, k] = cal.directions * qdd_plan
+                return q_arr, qd_arr, qdd_arr
 
-            max_err = np.max(np.abs(ideal - quant), axis=1)
-            lines.append(f"\nMove time: {tf:.3f} s")
-            lines.append("Max quantization error (deg): " +
-                          ", ".join(f"{e:.3f}" for e in max_err))
+            ideal_q_hr, ideal_qd_hr, ideal_qdd_hr = compute_states(t_hr)
+            ideal_q_wp, ideal_qd_wp, ideal_qdd_wp = compute_states(t_wp)
+            quant_q_wp = np.round(ideal_q_wp / res) * res
+
+            max_err = np.max(np.abs(ideal_q_wp - quant_q_wp), axis=1)
+            lines.append(f"Total move time: {tf:.3f} s | Number of Segments: {len(waypoints_list)-1}")
+            lines.append("Max quantization error (deg): " + ", ".join(f"{e:.3f}" for e in max_err))
             self.status.insert(tk.END, "\n".join(lines))
 
+            # Set Master Title for Total Time
+            self.fig.suptitle(f"Total Trajectory Time: {tf:.3f} Seconds", fontsize=14, fontweight='bold', color='navy')
+
             for j in range(5):
-                ax = self.axs[j]
-                ax.clear()
-                ax.plot(t, ideal[j], color="tab:blue", linewidth=1.2, label="Ideal")
-                ax.step(t, quant[j], color="tab:red", linewidth=1.0,
-                        where="post", label="Quantized")
-                ax.set_ylabel(JOINT_NAMES[j])
-                ax.grid(True, alpha=0.3)
-            self.axs[0].legend(loc="lower right", fontsize=7)
-            self.axs[-1].set_xlabel("Time (s)")
-            self.fig.tight_layout()
+                ax_pos = self.axs[j, 0]
+                ax_vel = self.axs[j, 1]
+                ax_acc = self.axs[j, 2]
+                
+                ax_pos.clear(); ax_vel.clear(); ax_acc.clear()
+
+                ax_pos.plot(t_hr, ideal_q_hr[j], color="tab:blue", linewidth=1.2, label="Continuous Path")
+                ax_pos.plot(t_wp, ideal_q_wp[j], marker='o', markersize=3, linestyle='None', color="black", alpha=0.5, label="Time Steps")
+                ax_pos.step(t_wp, quant_q_wp[j], color="tab:red", linewidth=1.0, where="post", label="Quantized")
+                ax_pos.set_ylabel(f"{JOINT_NAMES[j]} Pos")
+                ax_pos.grid(True, alpha=0.3)
+
+                ax_vel.plot(t_hr, ideal_qd_hr[j], color="tab:orange", linewidth=1.2)
+                ax_vel.set_ylabel(f"Vel (deg/s)")
+                ax_vel.grid(True, alpha=0.3)
+
+                ax_acc.plot(t_hr, ideal_qdd_hr[j], color="tab:green", linewidth=1.2)
+                ax_acc.set_ylabel(f"Acc (deg/s²)")
+                ax_acc.grid(True, alpha=0.3)
+                
+                # Draw vertical lines for via points
+                for via_t in traj.via_times:
+                    ax_pos.axvline(via_t, color='gray', linestyle='--', alpha=0.5)
+                    ax_vel.axvline(via_t, color='gray', linestyle='--', alpha=0.5)
+                    ax_acc.axvline(via_t, color='gray', linestyle='--', alpha=0.5)
+                
+                if j == 0:
+                    ax_pos.set_title("Position (Degrees)")
+                    ax_vel.set_title("Velocity (Deg/s)")
+                    ax_acc.set_title("Acceleration (Deg/s²)")
+
+            self.axs[0, 0].legend(loc="best", fontsize=7)
+            
+            # Format X-axis to explicitly show timestamps of via points
+            for col in range(3):
+                self.axs[-1, col].set_xlabel("Time (s)", fontweight='bold')
+                self.axs[-1, col].set_xticks(traj.via_times)
+                self.axs[-1, col].set_xticklabels([f"{t:.2f}" for t in traj.via_times], rotation=45, fontsize=8)
+
+            # Adjust layout to make room for the big master title at the top
+            self.fig.tight_layout(rect=[0, 0.02, 1, 0.96])
             self.canvas.draw()
 
         except Exception as e:
-            self.status.insert(tk.END, f"Error: {e}")
+            self.status.insert(tk.END, f"Error: {str(e)}")
 
 
 if __name__ == "__main__":
