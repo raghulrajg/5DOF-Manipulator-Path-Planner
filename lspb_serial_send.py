@@ -45,19 +45,7 @@ print(f"\nik() found {len(all_sols)} valid solution(s) (deg):")
 for s in all_sols:
     print(" ", np.round(np.degrees(s), 2))
 
-# Best solution: constrained to joint limits internally, and biased
-# toward q_current so the solver doesn't jump to an equally-valid but
-# unexpected branch. If you have a raw Cartesian pose (not built from
-# known joint angles), set q_current to whatever starting pose you want
-# the solver biased toward (e.g. the arm's current actual pose).
-q_current = np.zeros(5)
-q_solved = solve(p, q_current=q_current, R=R)
-
-if q_solved is None:
-    raise RuntimeError("No valid IK solution found within joint limits for this target. "
-                        "Check the target in lspb_quantized_plot.py BEFORE sending to hardware.")
-
-q_true_hw_target = np.degrees(q_solved)
+q_true_hw_target = np.degrees(all_sols[0])
 print("\nSelected joint target (deg):", np.round(q_true_hw_target, 2))
 
 # ======================================================================
