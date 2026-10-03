@@ -1,85 +1,37 @@
-"""
-lspb_quantized_plot.py
-
-Plans an LSPB trajectory from a Cartesian target, using bounded nonlinear
-least-squares inverse kinematics (joint limits enforced directly in the
-solver), quantizes to 1-degree servo resolution, and plots ideal vs
-quantized joint paths. No serial output -- plotting/verification only
-(see lspb_ik_serial_send.py for the version that streams to hardware).
-
-================================================================
-UPDATED DH TABLE (no qh helper joint)
-================================================================
-q = [0,0,0,0,0] corresponds directly to hardware home
-(servo = [90,180,180,90,0]). Joint limits (degrees):
-    theta1: -90 to 90     theta2: -180 to 0     theta3: 0 to 180
-    theta4: -90 to 90     theta5: 0 to 180
-
-================================================================
-JOINT LIMITS -> SERVO DIRECTION
-================================================================
-With offsets=[90,180,180,90,0] (unchanged), matching the stated limits
-requires directions=[1,1,-1,1,1] -- only q3 needs its servo direction
-FLIPPED relative to q1/q2/q4/q5 (verified: [1,1,1,1,1] gives q3 range
-[-180,0], not the stated [0,180]; flipping only q3 fixes it, and q2's
-[-180,0] already matches with no flip needed -- this is different from
-the previous DH table, where q2 also needed flipping).
-
-================================================================
-WHY BOUNDED LEAST-SQUARES OPTIMIZATION
-================================================================
-scipy.optimize.least_squares (trust-region reflective) with bounds=...
-enforces joint limits AS PART OF the search and converges reliably even
-near joint-limit boundaries, unlike a scalar bounded minimizer or an
-unconstrained iterative solver (DLS) needing post-hoc reject/clip.
-================================================================
-"""
-
 import numpy as np
 import matplotlib.pyplot as plt
 
 from lspb_joint_limits import ServoCalibration, LSPBTrajectory
-from python_arm.kinematics import get_forward_kinematics, inverse_kinematics_optimized
+from arm5dof import fk, ik, pitch_from_rotation, solve
 
 JOINT_NAMES = ["q1", "q2", "q3", "q4", "q5"]
 SERVO_RESOLUTION_DEG = 1.0
 
-# ---- Hardware calibration: offsets unchanged, direction per note above ----
+# ---- Hardware calibration: offsets/direction from physical measurement ----
 cal = ServoCalibration(offsets=[90, 180, 180, 90, 0],
                         directions=[1, 1, -1, 1, 1],   # verify q3 on hardware!
                         servo_min=0, servo_max=180)
 
-# ---- Joint constraints (radians, for the IK optimizer's bounds) ----
-JOINT_BOUNDS_DEG = [(-90, 90), (-180, 0), (0, 180), (-90, 90), (0, 180)]
-JOINT_BOUNDS_RAD = [(np.radians(lo), np.radians(hi)) for lo, hi in JOINT_BOUNDS_DEG]
-
-print("Joint bounds (deg):")
-for i in range(5):
-    print(f"  {JOINT_NAMES[i]}: {JOINT_BOUNDS_DEG[i]}")
+print("Servo-calibration joint limits (deg):")
+cal.print_limits(JOINT_NAMES)
 
 # ======================================================================
 # 1. Solve IK for the Cartesian target
 # ======================================================================
-q_default = [np.radians(0), np.radians(-26), np.radians(73), np.radians(5), np.radians(0)]
-T_target = get_forward_kinematics(q_default)
+q_default = np.radians([32, -147, 27, 5, 120])
+T_target = fk(q_default)
+p, R = T_target[:3, 3], T_target[:3, :3]
+pitch = pitch_from_rotation(p, R)
 
-# Passing q_default as primary_guess biases the solver toward THIS exact
-# configuration, rather than an equally-valid but different one -- the
-# arm is redundant for some poses (multiple joint sets can reach the
-# same pose), so without this the solver has no way to know which one
-# you actually meant.
-print(T_target)
-q_solved, cost, success = inverse_kinematics_optimized(
-    T_target, JOINT_BOUNDS_RAD, primary_guess=q_default)
+# All valid solutions -- diagnostic only, shows how many branches reach
+# this pose (the arm can be redundant for some targets).
+all_sols = ik(p, pitch, R)
+print(f"\nik() found {len(all_sols)} valid solution(s) (deg):")
+for s in all_sols:
+    print(" ", np.round(np.degrees(s), 2))
 
-print(f"\nIK cost: {cost:.2e}   success: {success}")
-if not success:
-    print("WARNING: IK did not converge cleanly -- verify the plot below "
-          "carefully, or this target may be unreachable within the given "
-          "joint bounds.")
-
-q_true_hw_target = np.degrees(q_solved)   # kin == true-DH-hw directly
-print("Solved joint target (deg):", np.round(q_true_hw_target, 2))
+q_true_hw_target = np.degrees(all_sols[0])
+print("\nSelected joint target (deg):", np.round(q_true_hw_target, 2))
 
 # ======================================================================
 # 2. Plan the move (true-DH space: 0 = calibrated hardware home)
@@ -106,7 +58,7 @@ class _LimitCheck:
 traj.cal = _LimitCheck()
 traj.joint_names = JOINT_NAMES
 
-print("\nTrue DH / servo-calibration limits per joint:")
+print("\nServo-calibration limits per joint (deg), re-checked before planning:")
 for i in range(5):
     print(f"  {JOINT_NAMES[i]}: [{cal.q_min[i]:.1f}, {cal.q_max[i]:.1f}]")
 
@@ -137,7 +89,7 @@ for j in range(5):
     axs[j].grid(True, alpha=0.3)
 axs[0].legend(loc="lower right", fontsize=8)
 axs[-1].set_xlabel("Time (s)")
-fig.suptitle("IK-optimized LSPB Trajectory: Ideal vs 1° Servo Resolution", y=0.995)
+fig.suptitle("IK-solved LSPB Trajectory: Ideal vs 1° Servo Resolution", y=0.995)
 plt.tight_layout()
 plt.savefig("lspb_quantized_path.png", dpi=150)
 print("Saved plot.")
